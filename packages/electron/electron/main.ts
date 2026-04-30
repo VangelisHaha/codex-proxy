@@ -18,6 +18,11 @@ import {
   stopAutoUpdater,
 } from "./auto-updater.js";
 import { IS_MAC } from "./constants.js";
+import {
+  buildTrayAccountTooltip,
+  summarizeTrayAccounts,
+  type TrayAccountSummaryInput,
+} from "./tray-status.js";
 
 
 let mainWindow: BrowserWindow | null = null;
@@ -25,6 +30,9 @@ let tray: Tray | null = null;
 let serverHandle: { close: () => Promise<void>; port: number } | null = null;
 let isQuitting = false;
 let allowProcessExit = false;
+let trayStatusTimer: ReturnType<typeof setInterval> | null = null;
+let lastTrayStatusTitle: string | null = null;
+let trayStatusRefreshing = false;
 
 // Single instance lock
 const gotLock = app.requestSingleInstanceLock();
@@ -148,6 +156,7 @@ app.on("ready", async () => {
 
     // 4. System tray
     createTray();
+    startTrayStatusRefresh();
 
     // 5. Main window
     createWindow();
@@ -253,6 +262,7 @@ function createWindow(): void {
 function quitApplication(): void {
   allowProcessExit = true;
   isQuitting = true;
+  stopTrayStatusRefresh();
 
   if (serverHandle) {
     const forceQuit = setTimeout(() => {
@@ -330,6 +340,52 @@ function rebuildTrayMenu(): void {
   }
 }
 
+async function refreshTrayStatus(): Promise<void> {
+  if (!tray || !serverHandle || trayStatusRefreshing) return;
+  trayStatusRefreshing = true;
+
+  try {
+    const response = await fetch(`http://127.0.0.1:${serverHandle.port}/auth/accounts`);
+    if (!response.ok) {
+      throw new Error(`GET /auth/accounts failed: ${response.status}`);
+    }
+    const data = await response.json() as { accounts?: TrayAccountSummaryInput[] };
+    const summary = summarizeTrayAccounts(Array.isArray(data.accounts) ? data.accounts : []);
+    lastTrayStatusTitle = summary.title;
+
+    if (IS_MAC) {
+      tray.setTitle(summary.title);
+    }
+    tray.setToolTip(buildTrayAccountTooltip(summary));
+  } catch (err) {
+    if (!lastTrayStatusTitle) {
+      const summary = summarizeTrayAccounts([]);
+      lastTrayStatusTitle = summary.title;
+      if (IS_MAC) {
+        tray.setTitle(summary.title);
+      }
+      tray.setToolTip(buildTrayAccountTooltip(summary));
+    }
+    console.warn("[Electron] Failed to refresh tray account status:", err instanceof Error ? err.message : err);
+  } finally {
+    trayStatusRefreshing = false;
+  }
+}
+
+function startTrayStatusRefresh(): void {
+  if (trayStatusTimer) return;
+  void refreshTrayStatus();
+  trayStatusTimer = setInterval(() => {
+    void refreshTrayStatus();
+  }, 30_000);
+}
+
+function stopTrayStatusRefresh(): void {
+  if (!trayStatusTimer) return;
+  clearInterval(trayStatusTimer);
+  trayStatusTimer = null;
+}
+
 function createTray(): void {
   // In packaged mode: icon is inside asar at {app.asar}/electron/assets/icon.png
   // In dev mode: relative to dist-electron/ → ../electron/assets/icon.png
@@ -373,6 +429,7 @@ app.on("before-quit", (event) => {
   }
 
   isQuitting = true;
+  stopTrayStatusRefresh();
   stopAutoUpdater();
 });
 
