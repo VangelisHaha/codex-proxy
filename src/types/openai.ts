@@ -39,6 +39,8 @@ export const ChatCompletionRequestSchema = z.object({
   temperature: z.number().optional(),
   top_p: z.number().optional(),
   max_tokens: z.number().optional(),
+  max_completion_tokens: z.number().optional(),
+  max_output_tokens: z.number().optional(),
   presence_penalty: z.number().optional(),
   frequency_penalty: z.number().optional(),
   stop: z.union([z.string(), z.array(z.string())]).optional(),
@@ -55,12 +57,16 @@ export const ChatCompletionRequestSchema = z.object({
         name: z.string(),
         description: z.string().optional(),
         parameters: z.record(z.unknown()).optional(),
+        strict: z.boolean().optional(),
       }),
     }),
     z.object({
       type: z.enum(["web_search", "web_search_preview"]),
       search_context_size: z.enum(["low", "medium", "high"]).optional(),
       user_location: z.record(z.unknown()).optional(),
+    }).passthrough(),
+    z.object({
+      type: z.literal("image_generation"),
     }).passthrough(),
   ])).optional(),
   tool_choice: z.union([
@@ -83,6 +89,7 @@ export const ChatCompletionRequestSchema = z.object({
     name: z.string(),
     description: z.string().optional(),
     parameters: z.record(z.unknown()).optional(),
+    strict: z.boolean().optional(),
   })).optional(),
   function_call: z.union([
     z.enum(["none", "auto"]),

@@ -145,16 +145,16 @@ curl http://localhost:8080/v1/chat/completions \
 - 自动完成 Chat Completions / Anthropic / Gemini ↔ Codex Responses API 双向协议转换
 - **Structured Outputs** — `response_format`（`json_object` / `json_schema`）和 Gemini `responseMimeType`
 - **Function Calling** — 原生 `function_call` / `tool_calls` 支持（所有协议）
-- 若使用自定义 API Keys，则仅兼容 OpenAI（`/v1/chat/completions`）格式。
+- **第三方 API Keys** — 支持 OpenAI / Anthropic / Gemini / OpenRouter / 自定义 OpenAI-compatible Provider，并按模型路由直通上游。
 
 ### 🔐 账号管理与智能轮换
 - **OAuth PKCE 登录** — 浏览器一键授权，无需手动复制 Token
 - **多账号轮换** — `least_used`（最少使用优先）、`round_robin`（轮询）、`sticky`（粘性）三种策略
 - **Plan Routing** — 不同 plan（free/plus/team/business）的账号自动路由到各自支持的模型
 - **Token 自动续期** — JWT 到期前自动刷新，指数退避重试
-- **配额自动刷新** — 后台每 5 分钟拉取各账号额度，达到阈值时弹出预警横幅；额度耗尽自动跳过
+- **配额被动采集** — 从上游响应头和 WebSocket rate limit 事件更新账号额度；`quota.refresh_interval_minutes` 仅控制用量快照记录，`0` 表示关闭快照定时器。
 - **封禁检测** — 上游 403 自动标记 banned；401 token 吊销自动过期并切换账号
-- **Relay 中转站** — 支持接入第三方 API 中转站（API Key + baseUrl），自动按 `format` 决定直通或翻译
+- **API Key Provider 池** — 支持通过 Dashboard 管理第三方 API Key、模型列表、导入导出和启停状态。
 - **Web 控制面板** — 账号管理、用量统计、批量操作，中英双语；远程访问需 Dashboard 登录门
 
 ### 🌐 代理池
@@ -195,8 +195,8 @@ curl http://localhost:8080/v1/chat/completions \
 │                                                          │
 │  ┌──────────┐  ┌───────────────┐  ┌──────────────────┐  │
 │  │   Auth   │  │  Fingerprint  │  │   Model Store    │  │
-│  │ OAuth/JWT│  │ Rust (rustls) │  │ Static + Dynamic │  │
-│  │  Relay   │  │  Headers/UA   │  │  Plan Routing    │  │
+│  │OAuth/API │  │ Rust (rustls) │  │ Static + Dynamic │  │
+│  │ API Keys │  │  Headers/UA   │  │  Plan Routing    │  │
 │  └──────────┘  └───────────────┘  └──────────────────┘  │
 │                                                          │
 └──────────────────────────────────────────────────────────┘
@@ -207,30 +207,32 @@ curl http://localhost:8080/v1/chat/completions \
                           │
                    ┌──────┴──────┐
                    ▼             ▼
-              chatgpt.com   Relay 中转站
+             chatgpt.com   第三方 Provider
          /backend-api/codex  (第三方 API)
 ```
 
 ## 📦 可用模型
 
-| 模型 ID | 推理等级 | 输出 | 说明 |
-|---------|---------|------|------|
-| `gpt-5.5` | low / medium / high / xhigh | 文本 | 通用旗舰（Plus+） |
-| `gpt-5.4` | low / medium / high / xhigh | 文本 | 最新旗舰模型（默认） |
-| `gpt-5.4-mini` | low / medium / high / xhigh | 文本 | 5.4 轻量版 |
-| `gpt-5.3-codex` | low / medium / high / xhigh | 文本 | 5.3 编程优化模型 |
-| `gpt-5.2` | low / medium / high / xhigh | 文本 | 专业工作 + 长时间代理 |
-| `gpt-5-codex` | low / medium / high | 文本 | GPT-5 编程模型 |
-| `gpt-5-codex-mini` | medium / high | 文本 | 轻量编程模型 |
-| `gpt-oss-120b` | low / medium / high | 文本 | 开源 120B 模型 |
-| `gpt-oss-20b` | low / medium / high | 文本 | 开源 20B 模型 |
-| `gpt-image-2` | — | 图像 | 图像生成后端（Plus+，通过 `image_generation` 工具调用） |
+| 模型 ID | 推理等级 | 当前上下文 | 最大上下文 | 最大输出 | 输出 | 说明 |
+|---------|---------|------------|------------|----------|------|------|
+| `gpt-5.5` | low / medium / high / xhigh | 272,000 | 272,000 | 128,000 | 文本 | 通用旗舰（Plus+） |
+| `gpt-5.4` | low / medium / high / xhigh | 272,000 | 1,000,000 | 128,000 | 文本 | 最新旗舰模型（默认） |
+| `gpt-5.4-mini` | low / medium / high / xhigh | 400,000 | 未公开 | 128,000 | 文本 | 5.4 轻量版 |
+| `gpt-5.3-codex` | low / medium / high / xhigh | 400,000 | 未公开 | 128,000 | 文本 | 5.3 编程优化模型 |
+| `gpt-5.2` | low / medium / high / xhigh | 400,000 | 未公开 | 128,000 | 文本 | 专业工作 + 长时间代理 |
+| `gpt-5-codex` | low / medium / high | 400,000 | 未公开 | 128,000 | 文本 | GPT-5 编程模型 |
+| `gpt-5-codex-mini` | medium / high | 未公开 | 未公开 | 未公开 | 文本 | 轻量编程模型 |
+| `gpt-oss-120b` | low / medium / high | 131,072 | 未公开 | 未公开 | 文本 | 开源 120B 模型 |
+| `gpt-oss-20b` | low / medium / high | 131,072 | 未公开 | 未公开 | 文本 | 开源 20B 模型 |
+| `gpt-image-2` | — | — | — | — | 图像 | 图像生成后端（Plus+，通过 `image_generation` 工具调用） |
 
 > **后缀**：任意 chat 模型名后追加 `-fast` 启用 Fast 模式，`-high`/`-low` 切换推理等级。例如：`gpt-5.4-fast`、`gpt-5.4-high-fast`。图像模型（`gpt-image-2`）不支持后缀。
 >
 > **Plan Routing**：不同 plan（free/plus/team/business）的账号自动路由到各自支持的模型。模型列表由后端动态获取，自动同步。
 >
 > **前端模型选择 ≠ 配置文件**：Dashboard 中切换模型只影响前端展示和 API 示例中的模型名，**不会修改** `config/default.yaml` 或 `data/local.yaml` 中的 `model.default`。实际使用哪个模型取决于客户端请求中的 `model` 字段（如 Cursor、Claude Code 等自行指定），配置文件中的 `model.default` 仅在客户端未指定模型时作为兜底。
+>
+> **Max token 说明**：上表是 Codex 运行时模型目录元数据，用于展示和客户端参考；运行时从 Codex 后端拉到的模型信息会覆盖静态值，并保留 `contextWindow`、`maxContextWindow`、`maxOutputTokens`、`truncationPolicyLimit`。实测 2026-05-08 的 Codex 后端对 `gpt-5.5` 回传 `context_window=272000`、`max_context_window=272000`、`truncation_policy.limit=10000`，对 `gpt-5.4` 回传 `context_window=272000`、`max_context_window=1000000`、`truncation_policy.limit=10000`，可能和公开模型页不同。请求体里的 `context_window` / `max_context_window` / `truncation_policy` / `max_output_tokens` 都不是可用开关；直接转发给 Codex 原生接口会返回 `400 Unsupported parameter`。
 
 ### 🖼️ 图像生成
 
@@ -256,6 +258,8 @@ curl -N http://localhost:8080/v1/responses \
 
 **编辑模式**（带参考图）：在 user message 的 `content` 里追加 `{"type":"input_image","image_url":"data:image/png;base64,..."}` 即可。
 
+> `/v1/chat/completions` 兼容路径会接受 `image_generation` 工具，避免 OpenAI 客户端因 schema 失败；但图像 payload 只有 `/v1/responses` 会稳定透出 `image_generation_call.result`。需要拿到图片字节时请使用 `/v1/responses`。
+
 ## 🔗 客户端接入
 
 > 所有客户端的 API Key 均从控制面板 (`http://localhost:8080`) 获取。模型名填具体 ID（默认 `gpt-5.4`）或任意 [可用模型](#-可用模型) ID。
@@ -271,7 +275,7 @@ claude
 
 > 控制面板的 **Anthropic SDK Setup** 卡片可一键复制环境变量（含 Opus / Sonnet / Haiku 层级模型配置）。
 >
-> 推荐模型：Opus → `gpt-5.4`，Sonnet → `gpt-5.3-codex`，Haiku → `gpt-5.4-mini`。
+> 推荐模型：Opus → `gpt-5.5`，Sonnet → `gpt-5.4`，Haiku → `gpt-5.3-codex`。
 >
 > ⚠️ 配置不生效？请参考 **[Claude Code 配置避坑指南](.github/guides/claude-code-setup.md)**（AUTH_TOKEN 劫持、API Key 黑名单等常见问题）。
 
@@ -283,17 +287,79 @@ claude
 name = "Codex Proxy"
 base_url = "http://localhost:8080/v1"
 wire_api = "responses"
-env_key = "PROXY_API_KEY"
+
+# 直接把 API Key 写进 config（推荐：本地单用户场景）
+[model_providers.proxy_codex.http_headers]
+Authorization = "Bearer your-api-key"
 
 [profiles.default]
 model = "gpt-5.4"
 model_provider = "proxy_codex"
 ```
 
-```bash
-export PROXY_API_KEY=your-api-key
-codex
+> 💡 也可以改用环境变量：把 `[model_providers.proxy_codex.http_headers]` 这两行删掉，换成 `env_key = "PROXY_API_KEY"`，然后 `export PROXY_API_KEY=your-api-key && codex`。需要避免密钥落到 config 文件（多人共享 / 开源仓库）时用这个。
+
+### Claude Desktop
+
+1. **开启开发者模式**：点击菜单栏 **Help** → **Troubleshooting** → **Enable Developer Mode**。
+2. **配置第三方推理**：点击菜单栏新出现的 **Developer** → **Configure Third-Party Inference...**。
+3. **填写配置**：
+   - **Endpoint**: `http://127.0.0.1:8080`
+   - **API Key**: 你的 API Key
+   - **Model**: `claude-opus-4-7` / `claude-sonnet-4-6` / `claude-haiku-4-5`
+
+> 或手动修改配置文件（Windows 下路径通常在 `%APPDATA%\Claude-3p\configLibrary\` 目录下的 JSON 文件，Mac 为 `~/Library/Application Support/Claude-3p/configLibrary/`），添加如下字段：
+```json
+ {
+   "disableDeploymentModeChooser": true,
+   "inferenceProvider": "gateway",
+   "inferenceGatewayBaseUrl": "http://127.0.0.1:8080",
+   "inferenceGatewayApiKey": "your-api-key",
+   "inferenceGatewayAuthScheme": "bearer",
+   "inferenceModels": [
+     "claude-opus-4-7",
+     "claude-sonnet-4-6",
+     "claude-haiku-4-5"
+   ]
+ }
 ```
+
+默认映射在 `config/models.yaml` 的 `aliases` 里，可自行改：
+```yaml
+aliases:
+  claude-opus-4-7: gpt-5.5
+  claude-sonnet-4-6: gpt-5.4
+  claude-haiku-4-5: gpt-5.3-codex
+```
+
+> 💡 **排查提示 (Windows)**: 如果使用 `127.0.0.1` 时 Claude Desktop 提示 `ERR_CONNECTION_REFUSED`（而使用 `localhost` 提示 URL 格式错误），说明 Node.js 在你的系统上默认只绑定了 IPv6。请进入 Codex Proxy 控制面板的设置页面，将 **Host** 修改为 `127.0.0.1`，或在 `data/local.yaml` 中添加 `server: { host: "127.0.0.1" }` 后重启代理。
+> 
+> 💡 **局域网使用提示 (LAN)**: Claude Desktop 强制校验 API 地址，**只允许** `https://` 开头或 `http://127.0.0.1`。如果你将 Codex Proxy 部署在局域网另一台机器（如 `192.168.x.x`），直接填入会报错。解决方法：
+> 1. **SSH 隧道 (最简单)**：在客户端机器运行 `ssh -L 8080:127.0.0.1:8080 user@192.168.x.x`，然后在 Claude 里填 `http://127.0.0.1:8080`。
+> 2. **反向代理**：使用 Caddy 或 Nginx 配置局域网 HTTPS 证书。
+
+### Codex Desktop (官方应用)
+
+官方客户端与 CLI 共用配置文件，修改后需重启客户端生效。
+
+`~/.codex/config.toml`:
+```toml
+[model_providers.proxy_codex]
+name = "Codex Proxy"
+base_url = "http://localhost:8080/v1"
+wire_api = "responses"
+
+[model_providers.proxy_codex.http_headers]
+Authorization = "Bearer your-api-key"
+
+[profiles.default]
+model = "gpt-5.4"
+model_provider = "proxy_codex"
+```
+
+> 💡 **为什么不用 `env_key`？** macOS / Windows 的 GUI 应用不读 shell 的 `~/.zshrc` / `.bashrc`，光 `export PROXY_API_KEY=...` 在终端里 GUI 进程根本看不到，启动会直接报 `Missing environment variable`。`http_headers` 把 Authorization 写在 config 里，重启 Codex 就能用，不用折腾 `launchctl setenv` 或 LaunchAgent。需要密钥从配置文件解耦时（共享机器 / 仓库提交）再换回 `env_key = "PROXY_API_KEY"` 走环境变量。
+>
+> ⚠️ 如果你是通过"登录 ChatGPT 账号"方式使用的，客户端可能会忽略此配置——只要 `[model_providers.proxy_codex]` 配上、`profiles.default.model_provider = "proxy_codex"`，新会话就会走 proxy；登录会话仍可能直接走官方上游。
 
 ### Claude for VSCode / JetBrains
 
@@ -443,13 +509,27 @@ for await (const chunk of stream) {
 | `model` | `default`, `default_reasoning_effort`, `inject_desktop_context` | 默认模型与推理配置 |
 | `auth` | `rotation_strategy`, `rate_limit_backoff_seconds` | 轮换策略与限流退避 |
 | `tls` | `proxy_url`, `force_http11` | TLS 代理与 HTTP 版本 |
-| `quota` | `refresh_interval_minutes`, `warning_thresholds`, `skip_exhausted` | 额度刷新与预警 |
+| `quota` | `refresh_interval_minutes`, `warning_thresholds`, `skip_exhausted` | 用量快照、阈值配置与耗尽账号跳过 |
 | `session` | `ttl_minutes`, `cleanup_interval_minutes` | Dashboard session 管理 |
 | `ollama` | `enabled`, `host`, `port`, `version`, `disable_vision` | Ollama 兼容桥接 |
+| `official_agent` | `enabled`, `api_key`, `app_server_url`, `auth` | 官方 Codex app-server 桥接，用于复用 Chrome/browser 插件 |
+
+### 配额轮转
+
+`quota.skip_exhausted: true` 时，账号池会在选择账号前跳过缓存额度已经耗尽的账号；这个过滤发生在 session affinity / `preferredEntryId` 之前，所以长对话也不会强行粘到已耗尽账号上。
+
+当前跳过条件是缓存额度里的 `rate_limit.limit_reached === true`、`secondary_rate_limit.limit_reached === true` 或 `code_review_rate_limit.limit_reached === true`。如果只是 `used_percent` 接近 100（例如 99%）但上游还没标记 `limit_reached`，代理仍会继续使用该账号；真正打到上游 429 后，账号会进入 `rate_limited` 退避并切换到其他可用账号。secondary / code review 窗口自己的 `reset_at` 过期后会从缓存中清除，避免账号被永久跳过。
 
 ### 局域网访问
 
-默认监听 `127.0.0.1`（仅本机）。如需局域网内其他设备访问，在 `data/local.yaml` 中添加：
+源码/容器默认配置监听 `::`（IPv6 unspecified，通常也覆盖本机访问）；Electron 启动时会传入 `127.0.0.1`，除非 `data/local.yaml` 显式覆盖。建议需要仅本机访问时写入：
+
+```yaml
+server:
+  host: "127.0.0.1"
+```
+
+如需局域网内其他设备访问，在 `data/local.yaml` 中添加：
 
 ```yaml
 server:
@@ -481,10 +561,10 @@ tls:
 ```yaml
 server:
   proxy_api_key: "pwd"    # 自定义密钥，客户端用 Bearer pwd 访问
-  # proxy_api_key: null   # null = 自动生成 codex-proxy-xxxx 格式密钥
+  # proxy_api_key: null   # null = 不配置全局密钥；已登录账号仍会生成 account-level codex-proxy-xxxx 密钥
 ```
 
-当前密钥始终显示在控制面板的 API Configuration 区域。
+首次启动如果缺少 `data/local.yaml`，程序会自动创建 `server.proxy_api_key: pwd`。当前可用密钥显示在控制面板的 API Configuration 区域。
 
 ### Ollama Bridge 配置
 
@@ -515,6 +595,67 @@ Docker 部署时，如果希望宿主机访问 `11434`：
 
 浏览器 CORS 访问仅允许 `localhost`、`127.x.x.x`、`::1` 等 loopback origin；非本机网页来源不能读取桥接响应。Bridge 会为 `/v1/*` 直通请求注入已配置的 Codex Proxy API Key，因此暴露到 localhost 之外时，相当于也把主代理 API 以无鉴权方式暴露出去。
 
+### Official Agent Bridge 配置
+
+该桥接用于连接本机官方 `codex app-server`，从而复用 Codex app 的官方 Chrome/browser 插件、审批和 app mention 能力。默认关闭，不影响现有 `/v1/*` 模型代理。
+
+先启动官方 app-server：
+
+```bash
+codex app-server --listen ws://127.0.0.1:4500
+```
+
+然后在 `data/local.yaml` 启用：
+
+```yaml
+server:
+  proxy_api_key: "your-api-key"
+
+official_agent:
+  enabled: true
+  api_key: "your-official-agent-key"
+  app_server_url: ws://127.0.0.1:4500
+  auth:
+    type: none
+```
+
+如果 app-server 使用 capability token：
+
+```bash
+codex app-server --listen ws://127.0.0.1:4500 \
+  --ws-auth capability-token \
+  --ws-token-file /absolute/path/to/token
+```
+
+对应配置：
+
+```yaml
+server:
+  proxy_api_key: "your-api-key"
+
+official_agent:
+  enabled: true
+  api_key: "your-official-agent-key"
+  app_server_url: ws://127.0.0.1:4500
+  auth:
+    type: capability_token
+    token_file: /absolute/path/to/token
+```
+
+可用端点：
+
+```bash
+curl http://localhost:8080/official-agent/apps \
+  -H "Authorization: Bearer your-official-agent-key"
+```
+
+```bash
+curl -N http://localhost:8080/official-agent/threads/{threadId}/turns \
+  -H "Authorization: Bearer your-official-agent-key" \
+  -H "Content-Type: application/json" \
+  -d '{"text":"Open localhost:8080 and inspect the dashboard","app":{"id":"chrome","name":"Chrome"}}'
+```
+
 ### 环境变量覆盖
 
 | 环境变量 | 覆盖配置 |
@@ -532,7 +673,7 @@ Docker 部署时，如果希望宿主机访问 `11434`：
 ## 📡 API 端点
 
 <details>
-<summary>点击展开完整端点列表</summary>
+<summary>点击展开主要端点列表</summary>
 
 **协议端点**
 
@@ -540,8 +681,13 @@ Docker 部署时，如果希望宿主机访问 `11434`：
 |------|------|------|
 | `/v1/chat/completions` | POST | OpenAI 格式聊天补全 |
 | `/v1/responses` | POST | Codex Responses API 直通 |
+| `/v1/responses/compact` | POST | Codex compact 响应代理 |
 | `/v1/messages` | POST | Anthropic 格式聊天补全 |
 | `/v1/models` | GET | 可用模型列表 |
+| `/v1/models/catalog` | GET | Dashboard 使用的完整模型目录 |
+| `/v1/models/:modelId/info` | GET | 单个模型的推理等级等详情 |
+| `/v1beta/models` | GET | Gemini 格式模型列表 |
+| `/v1beta/models/:modelAction` | POST | Gemini `generateContent` / `streamGenerateContent` |
 | `:11434/api/chat` | POST | Ollama 兼容聊天补全（需启用 Ollama Bridge） |
 
 **账号与认证**
@@ -553,9 +699,27 @@ Docker 部署时，如果希望宿主机访问 `11434`：
 | `/auth/accounts` | POST | 添加单个账号（token 或 refreshToken） |
 | `/auth/accounts/import` | POST | 批量导入账号 |
 | `/auth/accounts/export` | GET | 导出账号（`?format=minimal` 精简格式） |
-| `/auth/accounts/relay` | POST | 添加 Relay 中转站账号 |
 | `/auth/accounts/batch-delete` | POST | 批量删除账号 |
 | `/auth/accounts/batch-status` | POST | 批量修改账号状态 |
+| `/auth/accounts/health-check` | POST | 批量检测账号可用性 |
+| `/auth/accounts/:id/refresh` | POST | 刷新并探测单个账号 |
+| `/auth/accounts/:id/quota` | GET | 主动查询单个账号额度 |
+| `/auth/accounts/:id/cookies` | GET/POST/DELETE | 管理账号 Cloudflare cookies |
+| `/auth/quota/warnings` | GET | 当前额度预警状态 |
+
+**第三方 API Keys**
+
+| 端点 | 方法 | 说明 |
+|------|------|------|
+| `/auth/api-keys/catalog` | GET | 内置 Provider 与推荐模型目录 |
+| `/auth/api-keys` | GET/POST | API Key 列表 / 添加 |
+| `/auth/api-keys/models` | POST | 从自定义 OpenAI-compatible Provider 拉取模型 |
+| `/auth/api-keys/export` | GET | 导出 API Key 配置 |
+| `/auth/api-keys/import` | POST | 导入 API Key 配置 |
+| `/auth/api-keys/batch-delete` | POST | 批量删除 API Key |
+| `/auth/api-keys/:id` | DELETE | 删除单个 API Key |
+| `/auth/api-keys/:id/label` | PATCH | 修改 API Key 标签 |
+| `/auth/api-keys/:id/status` | PATCH | 启用或停用 API Key |
 
 **账号导入导出示例**
 
@@ -599,6 +763,11 @@ curl -X POST http://localhost:8080/auth/accounts/import \
 | `/admin/refresh-models` | POST | 手动刷新模型列表 |
 | `/admin/usage-stats/summary` | GET | 用量统计汇总 |
 | `/admin/usage-stats/history` | GET | 用量时间序列 |
+| `/admin/logs` | GET | 请求日志列表 |
+| `/admin/logs/state` | GET/POST | 日志采集开关与配置 |
+| `/admin/update-status` | GET | 自更新状态 |
+| `/admin/check-update` | POST | 检查更新 |
+| `/admin/apply-update` | POST | 执行自更新 |
 | `/health` | GET | 健康检查 |
 
 **代理池**
@@ -610,6 +779,11 @@ curl -X POST http://localhost:8080/auth/accounts/import \
 | `/api/proxies/:id/check` | POST | 健康检查单个代理 |
 | `/api/proxies/check-all` | POST | 全部代理健康检查 |
 | `/api/proxies/assign` | POST | 为账号分配代理 |
+| `/api/proxies/assignments` | GET | 查看账号代理分配 |
+| `/api/proxies/assign-bulk` | POST | 批量分配代理 |
+| `/api/proxies/assign-rule` | POST | 按规则分配代理 |
+| `/api/proxies/export` | GET | 导出代理池 YAML |
+| `/api/proxies/import` | POST | 导入代理池 YAML |
 
 </details>
 
@@ -637,13 +811,14 @@ curl -X POST http://localhost:8080/auth/accounts/import \
 - 发版流程引入 `dev` 分支 + beta channel：`bump-electron-beta.yml` 在 dev push 时打 `vX.Y.Z-beta.SHA` tag 出预发布包；`promote-dev-to-master.yml` 每天 14:00 UTC 检查 dev soak ≥24h + CI 绿后 fast-forward 到 master，再由现有 `bump-electron.yml` 出 stable tag (`.github/workflows/`)
 - `update.allow_prerelease` 配置项（默认 `false`）：开启后本地 Electron 通过 electron-updater 接收 beta channel 推送的预发布版本，便于自己的安装实测 dev 改动 (`src/config-schema.ts`、`packages/electron/electron/auto-updater.ts`、`config/default.yaml`)
 - `config/models.yaml`: `gpt-5.5` (Plus-only general-purpose chat) and `gpt-image-2` (Plus-only image-generation backend) entered the static catalog
+- Claude Desktop shell model aliases: `claude-opus-4-7` → `gpt-5.5`, `claude-sonnet-4-6` → `gpt-5.4`, `claude-haiku-4-5` → `gpt-5.3-codex`; users can edit `config/models.yaml` aliases to remap them
 - `CodexModelInfo.outputModalities` optional field on the model catalog interface to flag image-gen models apart from chat models (`src/models/model-store.ts`, `BackendModelEntry.output_modalities` also added for backend passthrough). `/v1/models/catalog` defaults missing values to `["text"]` so API output matches the documented contract.
 - README 新增图像生成小节 + 模型表 Output 列；`API.md` / `API_CN.md` 补 `image_generation` 工具参数矩阵、事件流、编辑模式文档
 - ...（[查看全部](./CHANGELOG.md)）
 **Changed**
 - Default model switched from `gpt-5.3-codex` → `gpt-5.4` (`config/default.yaml`, `config/models.yaml.isDefault`, Zod schema default in `src/config-schema.ts`). Removed the `codex` alias — clients must use full model IDs. Sonnet mapping in Anthropic preset/README 推荐表保持 `gpt-5.3-codex` 不变（编程场景更贴位）
 - Static `isDefault` and `outputModalities` on `config/models.yaml` entries now survive the backend dynamic fetch merge (previously the spread of normalized `undefined`/`false` silently clobbered YAML-declared values)
-- Dashboard session 默认 TTL 从 1 小时延长至 24 小时
+- Dashboard session TTL 由 `session.ttl_minutes` 控制；当前默认配置为 60 分钟
 **Fixed**
 - WebSocket 路径首帧若为上游 `usage_limit_reached` / `rate_limit*` / `quota_exhausted` / 鉴权类终止错误，转换为 `CodexApiError` 抛出，复用 HTTP 路径已有的账号轮转逻辑；恢复 2.0.62 的"智能切换"行为（`src/proxy/ws-transport.ts`）。错误若发生在已有内容流出之后，仍按当前行为透传给客户端
 - 无可用账号时不再执行无意义的重试，直接返回描述性错误信息（含各状态账号计数：rate-limited / expired / banned / disabled）(#362)

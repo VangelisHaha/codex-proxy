@@ -23,6 +23,32 @@ import type {
   AccountInfo,
   CodexQuota,
 } from "./types.js";
+import { hasReachedCachedQuota } from "./quota-skip.js";
+
+type ResettableQuotaWindow = {
+  used_percent: number | null;
+  reset_at: number | null;
+  limit_window_seconds?: number | null;
+  limit_reached: boolean;
+};
+
+function nextResetAt(resetAt: number, windowSec: number | null | undefined, nowSec: number): number | null {
+  if (windowSec == null || windowSec <= 0) return null;
+  const elapsedWindows = Math.floor((nowSec - resetAt) / windowSec) + 1;
+  return resetAt + elapsedWindows * windowSec;
+}
+
+function resetExpiredQuotaWindow(
+  quotaWindow: ResettableQuotaWindow | null | undefined,
+  nowSec: number,
+): boolean {
+  const resetAt = quotaWindow?.reset_at;
+  if (quotaWindow == null || resetAt == null || nowSec < resetAt) return false;
+  quotaWindow.used_percent = 0;
+  quotaWindow.limit_reached = false;
+  quotaWindow.reset_at = nextResetAt(resetAt, quotaWindow.limit_window_seconds, nowSec);
+  return true;
+}
 
 export class AccountRegistry {
   private accounts: Map<string, AccountEntry> = new Map();
@@ -80,7 +106,6 @@ export class AccountRegistry {
         cached_tokens: 0,
         empty_response_count: 0,
         last_used: null,
-        rate_limit_until: null,
         window_request_count: 0,
         window_input_tokens: 0,
         window_output_tokens: 0,
@@ -160,19 +185,62 @@ export class AccountRegistry {
   }
 
   /** Returns true if the entry was found and mutated. */
-  markRateLimited(
+  /**
+   * Handle an upstream 429 by writing into cachedQuota.rate_limit (primary
+   * bucket) as the single source of truth. 429 body carries no bucket marker;
+   * the next passive header collection on a successful response will overwrite
+   * with ground truth (which may upgrade this to secondary if needed).
+   *
+   * - Synthesizes a minimal cachedQuota if none exists yet (new account).
+   * - Never shrinks an existing reset_at — if cachedQuota already says we are
+   *   limited further in the future (e.g. weekly bucket), keep that.
+   * - Does NOT mutate `entry.status`; pool exclusion happens via
+   *   {@link hasReachedCachedQuota}.
+   *
+   * Returns true if the entry was found.
+   */
+  applyRateLimit429(
     entryId: string,
     backoffSeconds: number,
-    options?: { retryAfterSec?: number; countRequest?: boolean },
+    options?: { retryAfterSec?: number; resetsAtSec?: number; countRequest?: boolean },
   ): boolean {
     const entry = this.accounts.get(entryId);
     if (!entry) return false;
 
-    const backoff = jitter(options?.retryAfterSec ?? backoffSeconds, 0.2);
-    const until = new Date(Date.now() + backoff * 1000);
+    const nowSec = Date.now() / 1000;
+    const explicit = options?.resetsAtSec;
+    const fromRetry = options?.retryAfterSec != null
+      ? nowSec + jitter(options.retryAfterSec, 0.2)
+      : null;
+    const newResetAt = explicit ?? fromRetry ?? (nowSec + jitter(backoffSeconds, 0.2));
 
-    entry.status = "rate_limited";
-    entry.usage.rate_limit_until = until.toISOString();
+    const quota: CodexQuota = entry.cachedQuota ?? {
+      plan_type: entry.planType ?? "unknown",
+      rate_limit: {
+        allowed: false,
+        limit_reached: true,
+        used_percent: 100,
+        reset_at: newResetAt,
+        limit_window_seconds: entry.usage.limit_window_seconds ?? null,
+      },
+      secondary_rate_limit: null,
+      code_review_rate_limit: null,
+    };
+
+    const existingResetAt = quota.rate_limit.reset_at;
+    const finalResetAt = existingResetAt != null && existingResetAt > newResetAt
+      ? existingResetAt
+      : newResetAt;
+
+    quota.rate_limit = {
+      ...quota.rate_limit,
+      allowed: false,
+      limit_reached: true,
+      used_percent: Math.max(quota.rate_limit.used_percent ?? 0, 100),
+      reset_at: finalResetAt,
+    };
+    entry.cachedQuota = quota;
+    entry.quotaFetchedAt = new Date().toISOString();
 
     if (options?.countRequest) {
       entry.usage.request_count++;
@@ -180,38 +248,6 @@ export class AccountRegistry {
       entry.usage.window_request_count = (entry.usage.window_request_count ?? 0) + 1;
     }
 
-    this.schedulePersist();
-    return true;
-  }
-
-  /** Returns true if the entry was found and mutated. */
-  clearRateLimit(entryId: string): boolean {
-    const entry = this.accounts.get(entryId);
-    if (!entry) return false;
-    entry.status = "active";
-    entry.usage.rate_limit_until = null;
-    this.schedulePersist();
-    return true;
-  }
-
-  /** Returns true if the entry was found and actually changed. */
-  markQuotaExhausted(entryId: string, resetAtUnix: number | null): boolean {
-    const entry = this.accounts.get(entryId);
-    if (!entry) return false;
-    if (entry.status === "disabled" || entry.status === "expired" || entry.status === "banned" || entry.status === "refreshing") return false;
-
-    const until = resetAtUnix
-      ? new Date(resetAtUnix * 1000).toISOString()
-      : new Date(Date.now() + 300_000).toISOString();
-
-    if (entry.status === "rate_limited" && entry.usage.rate_limit_until) {
-      const existing = new Date(entry.usage.rate_limit_until).getTime();
-      const proposed = new Date(until).getTime();
-      if (proposed <= existing) return false;
-    }
-
-    entry.status = "rate_limited";
-    entry.usage.rate_limit_until = until;
     this.schedulePersist();
     return true;
   }
@@ -242,7 +278,11 @@ export class AccountRegistry {
     const now = new Date();
     for (const entry of this.accounts.values()) {
       this.refreshStatus(entry, now);
-      if (entry.status === "active") return true;
+      // "Authenticated" used to imply "has a usable account". After retiring
+      // status="rate_limited", we treat any cachedQuota-exhausted account as
+      // unusable too — otherwise an all-exhausted pool would falsely report
+      // authenticated and produce confusing 4xx on requests.
+      if (entry.status === "active" && !hasReachedCachedQuota(entry)) return true;
     }
     return false;
   }
@@ -250,10 +290,15 @@ export class AccountRegistry {
   /** Fast check: is there at least one active account not in the exclude list? */
   hasAvailableAccounts(excludeIds?: string[]): boolean {
     const now = new Date();
+    const skipExhausted = getConfig().quota.skip_exhausted === true;
     const excludeSet = excludeIds?.length ? new Set(excludeIds) : null;
     for (const entry of this.accounts.values()) {
       this.refreshStatus(entry, now);
-      if (entry.status === "active" && (!excludeSet || !excludeSet.has(entry.id))) {
+      if (
+        entry.status === "active" &&
+        (!excludeSet || !excludeSet.has(entry.id)) &&
+        (!skipExhausted || !hasReachedCachedQuota(entry))
+      ) {
         return true;
       }
     }
@@ -294,6 +339,8 @@ export class AccountRegistry {
     active: number;
     expired: number;
     quota_exhausted: number;
+    /** Count of accounts whose cachedQuota reports any bucket limit_reached.
+     *  Derived from cachedQuota, NOT from a "rate_limited" status (retired). */
     rate_limited: number;
     refreshing: number;
     disabled: number;
@@ -303,11 +350,14 @@ export class AccountRegistry {
     let active = 0, expired = 0, quota_exhausted = 0, rate_limited = 0, refreshing = 0, disabled = 0, banned = 0;
     for (const entry of this.accounts.values()) {
       this.refreshStatus(entry, now);
+      if (entry.status === "active" && hasReachedCachedQuota(entry)) {
+        rate_limited++;
+        continue;
+      }
       switch (entry.status) {
         case "active": active++; break;
         case "expired": expired++; break;
         case "quota_exhausted": quota_exhausted++; break;
-        case "rate_limited": rate_limited++; break;
         case "refreshing": refreshing++; break;
         case "disabled": disabled++; break;
         case "banned": banned++; break;
@@ -428,7 +478,6 @@ export class AccountRegistry {
       cached_tokens: 0,
       empty_response_count: 0,
       last_used: null,
-      rate_limit_until: null,
       window_reset_at: entry.usage.window_reset_at ?? null,
       window_request_count: 0,
       window_input_tokens: 0,
@@ -444,13 +493,6 @@ export class AccountRegistry {
   // ── Internal ──────────────────────────────────────────────────────
 
   refreshStatus(entry: AccountEntry, now: Date): void {
-    if (entry.status === "rate_limited" && entry.usage.rate_limit_until) {
-      if (now >= new Date(entry.usage.rate_limit_until)) {
-        entry.status = "active";
-        entry.usage.rate_limit_until = null;
-      }
-    }
-
     if (entry.status === "active" && isTokenExpired(entry.token)) {
       entry.status = "expired";
     }
@@ -474,12 +516,18 @@ export class AccountRegistry {
       this.schedulePersist();
     }
 
-    // Clear stale cached quota when its own reset time has passed
-    const quotaReset = entry.cachedQuota?.rate_limit?.reset_at;
-    if (quotaReset != null && nowSec >= quotaReset) {
-      entry.cachedQuota = null;
-      entry.quotaFetchedAt = null;
-      this.schedulePersist();
+    // Keep quota cards visible across reset boundaries. Passive quota collection
+    // will overwrite these inferred values on the next successful upstream turn.
+    const quota = entry.cachedQuota;
+    if (quota) {
+      let changed = false;
+      changed = resetExpiredQuotaWindow(quota.rate_limit, nowSec) || changed;
+      changed = resetExpiredQuotaWindow(quota.secondary_rate_limit, nowSec) || changed;
+      changed = resetExpiredQuotaWindow(quota.code_review_rate_limit, nowSec) || changed;
+
+      if (changed) {
+        this.schedulePersist();
+      }
     }
   }
 
