@@ -286,14 +286,14 @@ describe("auto-updater state machine", () => {
     expect(mockDialog.showMessageBox).not.toHaveBeenCalled();
   });
 
-  it("shows update-available dialog when explicitly enabled", () => {
+  it("skips update-available dialog even when explicitly enabled", () => {
     initAutoUpdater({ ...mockOptions, autoUpdate: true, showUpdateDialog: true });
 
     mockAutoUpdater.emit("update-available", { version: "3.0.0" });
 
     const state = getAutoUpdateState();
     expect(state.updateAvailable).toBe(true);
-    expect(mockDialog.showMessageBox).toHaveBeenCalledTimes(1);
+    expect(mockDialog.showMessageBox).not.toHaveBeenCalled();
   });
 
   it("skips dialog when autoDownload=true", () => {
@@ -309,6 +309,14 @@ describe("auto-updater state machine", () => {
 
   it("skips update-downloaded dialog by default", () => {
     initAutoUpdater(mockOptions);
+
+    mockAutoUpdater.emit("update-downloaded", { version: "3.0.0" });
+
+    expect(mockDialog.showMessageBox).not.toHaveBeenCalled();
+  });
+
+  it("skips update-downloaded dialog even when explicitly enabled", () => {
+    initAutoUpdater({ ...mockOptions, showUpdateDialog: true });
 
     mockAutoUpdater.emit("update-downloaded", { version: "3.0.0" });
 

@@ -11,13 +11,13 @@ describe("update modal auto-open policy", () => {
     })).toBe(false);
   });
 
-  it("auto-opens for new git updates when update popup setting is on", () => {
+  it("does not auto-open when update popup setting is on", () => {
     expect(shouldAutoOpenUpdateModal({
       hasUpdate: true,
       previousHasUpdate: false,
       mode: "git",
       showUpdateDialog: true,
-    })).toBe(true);
+    })).toBe(false);
   });
 
   it("does not auto-open for electron updates", () => {
@@ -35,7 +35,7 @@ describe("update dialog preference", () => {
     expect(getShowUpdateDialogPreference({})).toBe(false);
   });
 
-  it("reads show_update_dialog when present", () => {
-    expect(getShowUpdateDialogPreference({ settings: { show_update_dialog: true } })).toBe(true);
+  it("ignores show_update_dialog when present", () => {
+    expect(getShowUpdateDialogPreference({ settings: { show_update_dialog: true } })).toBe(false);
   });
 });

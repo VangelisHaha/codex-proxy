@@ -13,15 +13,10 @@ interface UpdateDialogPreferenceStatus {
   } | null;
 }
 
-export function getShowUpdateDialogPreference(status: UpdateDialogPreferenceStatus | null | undefined): boolean {
-  return status?.settings?.show_update_dialog ?? false;
+export function getShowUpdateDialogPreference(_status: UpdateDialogPreferenceStatus | null | undefined): boolean {
+  return false;
 }
 
-export function shouldAutoOpenUpdateModal({
-  hasUpdate,
-  previousHasUpdate,
-  mode,
-  showUpdateDialog,
-}: UpdateModalAutoOpenInput): boolean {
-  return showUpdateDialog && hasUpdate && !previousHasUpdate && mode !== "electron";
+export function shouldAutoOpenUpdateModal(_input: UpdateModalAutoOpenInput): boolean {
+  return false;
 }
